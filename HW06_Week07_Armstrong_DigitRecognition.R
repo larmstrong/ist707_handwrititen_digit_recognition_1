@@ -1,0 +1,578 @@
+
+## title: "HW07 - Digit Recognition"
+## author: "Leonard Armstrong"
+## date: "2/23/2019"
+
+
+##-------------------------------------------------------------------------------------------------
+## CLEAN START
+
+# Remove any non-default packages
+default_packages <- union(getOption("defaultPackages"), "base")
+loaded_packages <- .packages()
+extra_packages <- setdiff(x = loaded_packages, y = default_packages)
+invisible(
+  sapply(
+    X = extra_packages, 
+    FUN = function(x) detach(name = paste("package:", x, sep=""), character.only = TRUE)))
+
+# Remove all variables and functions from the global environment
+rm(list = ls())
+
+
+##-------------------------------------------------------------------------------------------------
+## LOAD LIBRARIES
+##
+## This section loads all required libraries.
+##
+## Library      | Purpose
+## ------------ | ---------------------------------------------------------------------
+## assertthat   | Create and manage assertions for ensuring proper states in the code.
+## e1071        | Naive Bayes functionality.
+## ggplot2      | Graphing and plotting functions.
+## gridExtra    | Grid layout for graphics.
+## here         | Working directory utilities.
+## rattle       | Decision tree graphing functions.
+## RColorBrewer | Color palette definitions.
+## rpart        | Decision tree models.
+## scales       | ggplot2 axis scaling functions.
+## stringi      | String management functions.
+
+library(assertthat)
+library(e1071)
+library(ggplot2)
+library(gridExtra)
+library(here)
+library(rattle)
+library(RColorBrewer)
+library(rpart)
+library(scales)
+library(stringi)
+
+
+##-------------------------------------------------------------------------------------------------
+## READ PROVIDED DATA SETS
+##
+
+# Set the random seed
+set.seed(100163)
+
+# Define observation sizes
+image_height <- 28
+image_width  <- 28
+image_size   <- image_height * image_width
+record_size  <- image_size + 1              # Add one for the label field. 
+
+# Define the relevant directories, file names, and file paths.
+cwd <- here::here()
+data_subdir <- "../data"
+training_filename <- "Kaggle-digit-train-sample-small-1400.csv"
+training_fullfilepath <- file.path(cwd, data_subdir, training_filename)
+test_filename <- "Kaggle-digit-test-sample1000.csv"
+test_fullfilepath <- file.path(cwd, data_subdir, test_filename)
+
+# Define training data datatypes as numerics.
+numeric_coltypes <- 
+  c("factor",                                # Label field
+    rep(x = "numeric", times = image_size))  # 28x28 pixel image greyscale byte fields.
+
+# Read the training data.
+train_num <- read.csv(
+  file = training_fullfilepath, header = TRUE, colClasses = numeric_coltypes, na.strings = "")
+pixel_min <- min(train_num[, -1])
+pixel_max <- max(train_num[, -1])
+cat("The minumim training data value is", pixel_min, "\n")
+cat("The maximum training data value is", pixel_max, "\n")
+
+# Create a factorized training data set.
+pixel_levels <- as.character(pixel_min:pixel_max)
+pixel_fac <- data.frame(lapply(
+  X = train_num[, -1], 
+  FUN = function(x) factor(x = x, levels = pixel_levels, labels = pixel_levels)))
+train_fac <- data.frame(label = train_num$label, pixel_fac)
+
+
+# Define number of folds for k-folds testing and the size of a fold.
+k_folds <- 10
+fold_size <- round(nrow(train_num)/k_folds)
+
+# Read the test data.
+test_data <- read.csv(
+  file = test_fullfilepath, header = TRUE, colClasses = numeric_coltypes, na.strings = "")
+binary_test_data <- data.frame(label = test_data$label, sign(test_data[, -1] > 32))
+
+binary_fac <- data.frame(lapply(
+  X = binary_test_data[, -1], 
+  FUN = function(x) factor(x = x, levels = c("0", "1"), labels = c("0", "1"))))
+test_binfac <- data.frame(label = rep("0", times = 1000), binary_fac)
+digit_labels <- c("0", "1", "2", "3", "4", "5", "6", "7", "8", "9")
+test_binfac$label <- factor(x = test_binfac$label, labels = digit_labels, levels = digit_labels)
+
+# Remove unneeded data
+rm(cwd, data_subdir, test_filename, test_fullfilepath, training_filename, training_fullfilepath)
+rm(pixel_fac, pixel_levels)
+rm(numeric_coltypes)
+
+
+##-------------------------------------------------------------------------------------------------
+## REVIEW AND CLEAN (IF NEEDED) PROVIDED DATA SETS
+##
+## In this section, the data sets will be reviewed for "cleanliness" and cleaned if needed.
+
+# Review NAs in the data
+cat("There are NAs in the numeric training data:", any(is.na(train_num)), "\n")
+cat("There are NAs in the factor training data:", any(is.na(train_fac)), "\n")
+
+
+##-------------------------------------------------------------------------------------------------
+## EXPLORATORY DATA ANALYSIS - DATA SUMMARIES
+##
+## This section, consists of numeric exploratory analysis of the data.
+
+# Show basic statistic summary of the training data.
+cat("Summary of the training data:\n", sep="")
+summary(as.numeric(train_num$label))
+cat("Standard deviation of the training data: ", sd(as.numeric(train_num$label)), "\n", sep="")
+
+# Review the means and standard deviations of each pixel and determine which pixels have zeros
+# for all training cases. 
+all_means <- apply(X=train_num[, -1], MARGIN = 2, FUN = mean)
+all_sds <- apply(X=train_num[, -1], MARGIN = 2, FUN = sd)
+all_zeros <- all_means[all_means == 0]
+cat(NROW(all_zeros), " pixels have zeros for every record.\n", sep="")
+
+# Remove unnecessary data
+rm (all_means, all_sds, all_zeros)
+
+
+##-------------------------------------------------------------------------------------------------
+## EXPLORATORY DATA ANALYSIS - DATA VISUALIZATIONS
+##
+## This section, consists of visual exploratory analysis of the data.
+
+# Create a support dataframe of labels, label counts and label percentages
+lcount <- table(train_num$label)
+lpct <- c(lcount/sum(lcount), use.names = FALSE)
+pctlab <- sprintf("%5.2f%%", lpct*100)
+pct_df <- data.frame(
+  name = rownames(lcount), 
+  count = lcount, 
+  pct = lpct, label = pctlab, 
+  use.name = FALSE)
+
+# Plot a bar chart of percentage used for each digit from the pct_df source.
+ghisto <- ggplot(data <- pct_df, mapping = aes(x = name, y = pct, label = label)) +
+  geom_col(fill = "goldenrod") + 
+  geom_text(vjust = 2) +
+  scale_y_continuous(name = "Percentage", labels = percent) +
+  labs(
+    title = "Distribution of Digit Representations Across 1400 Samples",
+    x = "Handwritten Digit",
+    fill = "Digit")
+
+# Display the plot.
+ghisto
+
+
+##-------------------------------------------------------------------------------------------------
+## VISUAL EDA
+
+#' create_spread_plot - Generate a dot plot of the distribution of each digit across the input
+#'   data set.
+#'
+#' @param x Input data set assumed to have a field named "label"
+#' @param subtitle Subtitle for the plot to be returned.
+#'
+#' @return A dot plot of the digit distributions in the input data frame.
+#' @export
+#'
+#' @examples create_spread_plot(train_num, "Original distribution")
+create_spread_plot <- function (x, subtitle) {
+  # Create a helper dataframe consisting of the data index (row) as an integer and the
+  # data value (digit label) as a character string.
+  spread_df <- data.frame(
+    index = as.integer(1:nrow(x)), 
+    value = as.character(x[, "label"]), 
+    stringsAsFactors = FALSE)
+  # Create a dotplot from the spread_df helper dataframe.
+  gdot <- ggplot(data = spread_df, mapping = aes(x = value, y = index)) +
+    geom_point(size = 1) +
+    scale_y_continuous(name = "Observation", breaks = seq(from = 0, to = nrow(x), by = 100)) +
+    labs(
+      title = "Spread of Each Digit Across All Observations",
+      subtitle = subtitle,
+      x = "Digit")
+  # Return the generated dotplot
+  return(gdot)
+}
+
+# Plot the distribution of the original data.
+gdot_original <- create_spread_plot(train_num, "Original distribution")
+gdot_original
+
+# Now try shuffling and replotting
+train_num_shuffle1 <- train_num[sample(nrow(train_num)), ]
+gdot_shuffle1 <- create_spread_plot(train_num_shuffle1, "Suffled Distribution #1")
+gdot_shuffle1
+
+# Shuffle and replot one more time.
+train_num_shuffle2 <- train_num_shuffle1[sample(nrow(train_num_shuffle1)), ]
+gdot_shuffle2 <- create_spread_plot(train_num_shuffle2, "Suffled Distribution #2")
+gdot_shuffle2
+
+# Create a 1x2 grid display of the two shuffled plots.
+grid.arrange(gdot_shuffle1, gdot_shuffle2, nrow = 1)
+
+
+# Keep the first shuffle to be used in the first analysis
+train1 <- train_num_shuffle1
+
+# Create a factorized training data set with the same shuffle as train1.
+pixel_levels <- as.character(pixel_min:pixel_max)
+pixel_fac <- data.frame(lapply(
+  X = train1[, -1], 
+  FUN = function(x) factor(x = x, levels = pixel_levels, labels = pixel_levels)))
+train_fac <- data.frame(label = train1$label, pixel_fac)
+
+rm (train_num_shuffle1, train_num_shuffle2)
+rm(pixel_levels, pixel_fac)
+
+
+##-------------------------------------------------------------------------------------------------
+
+#' display_image - Display a digitized version of the hand-drawn image from a single observation.
+#'
+#' @param x Image record consisting of a label field and 784 pixel fields. 
+#'   This function requires that the pixel fields are numerics.
+#'
+#' @return A ggplot of the digitized image.
+#' @export
+#'
+#' @examples display_image(train_num[123,])
+display_image <- function (x) {
+  # Define error messages
+  emsg_recordlen <- "Incorrect record length sent to display_image. Expected 785 values."
+  emsg_vartype <- "Incorrect data types sent to display_image. Numeric pixel values expected."
+  
+  # Verify that a record of the proper length was input
+  assert_that(ncol(x) == 785, msg = emsg_recordlen)
+  # Verify that the pixel fields are all numeric.
+  assert_that(all(apply(X = x[, -1], MARGIN = 2, FUN=is.number)), msg = emsg_vartype)
+  
+  rownums <- as.vector(sapply(X=c(1:28), FUN= function(x) rep(x, times=28)))
+  colnums <- rep(c(1:28), times = 28)
+  df <- data.frame(drow = rownums, dcol = colnums, ddat = unlist(x[2:785]), row.names = NULL)
+  
+  g <- ggplot(data = df, mapping = aes(x = dcol, y = -drow, fill = ddat)) +
+    geom_tile() +
+    scale_fill_continuous(low = "white", high = "black") +
+    coord_fixed(ratio = 4/3) + 
+    theme(
+      legend.position = "none", 
+      axis.text.x=element_blank(), axis.ticks.x=element_blank(), 
+      axis.title.y=element_blank(), axis.text.y=element_blank(), axis.ticks.y=element_blank()) +
+    labs(x = paste("Value = ", x$label, sep=""))
+  
+  return(g)
+}
+
+# Create a list of n random images.
+ilist <- list()
+num_images <- 28
+sample_value <- round(runif(n = num_images, min=1, max = 1400))
+for (i in 1:num_images) {
+  # Create an image graphic
+  ilist[[i]] <- display_image(train_num[sample_value[i],])
+}
+
+# Display all created images in a grid.
+g <- grid.arrange(
+  ilist[[1]], ilist[[2]], ilist[[3]], ilist[[4]], 
+  ilist[[5]], ilist[[6]], ilist[[7]], ilist[[8]],
+  ilist[[9]], ilist[[10]], ilist[[11]], ilist[[12]], 
+  ilist[[13]], ilist[[14]], ilist[[15]], ilist[[16]],
+  ilist[[17]], ilist[[18]], ilist[[19]], ilist[[20]],
+  ilist[[21]], ilist[[22]], ilist[[23]], ilist[[24]],
+  ilist[[25]], ilist[[26]], ilist[[27]], ilist[[28]],
+  nrow = 4)
+
+# Plot a barchart from a run's results.
+# df: Input data frame of run result data
+# st: Subtitle to be used on the plot.
+barchart_results <- function (df, st) {
+  # Plot a bar chart of percentage used for each digit from the pct_df source.
+  the_plot <- ggplot(data = df, mapping = aes(x = label)) +
+    stat_count(mapping = aes(fill = pred)) +
+    scale_fill_brewer(palette = "Spectral") + 
+    labs(
+      title = "Results of Final Fold Testing", 
+      subtitle = st,
+      x = "Digit",
+      y = "Count",
+      fill = "Predicted Digit")
+  
+  # Display the plot.
+  return(the_plot)
+}
+
+
+##-------------------------------------------------------------------------------------------------
+## ANALYSIS #1 - NAIVE BAYES WITH NUMERIC PIXEL VALUES
+##
+## Run an Naive Bayes analysis using numeric pixel values.
+
+cat("Analysis #1: Pixel data as numbers.\n")
+pctcorrect_total1 <- 0
+for (i in 1:k_folds) {
+  # Define the range of indices to be held out for cross-validation
+  holdout_range1 <- c(floor(fold_size * (i - 1) + 1):floor(fold_size * i))
+  train_range1 <- setdiff(1:nrow(train1), holdout_range1)
+  
+  nbmodel1 <- naiveBayes(
+    formula = formula("label ~ ."), 
+    data = train1, 
+    laplace = 1, 
+    na.action = na.fail, 
+    subset = train_range1)
+  pred1 <- predict(nbmodel1, newdata = train1[holdout_range1, ], type=c("class"))
+  
+  testcols1 <- train1[holdout_range1, "label"]
+  verify1 <- cbind(label = testcols1, pred = pred1)
+  
+  ncorrect1 <- sum(verify1[, "label"] == verify1[, "pred"])
+  pctcorrect1 <- ncorrect1/nrow(verify1)
+  pctcorrect_total1 <- pctcorrect_total1 + pctcorrect1
+  
+  cat("Test ", i, ": Predicted ", pctcorrect1, "\n", sep="")
+}
+cat("Overall: ", pctcorrect_total1/k_folds, " percent correctly predicted.\n", sep="")
+
+verify1_df <- data.frame(label = factor(verify1[, "label"]-1), pred = factor(verify1[, "pred"]-1))
+bc1 <- barchart_results(as.data.frame(verify1_df), st = "Analysis #1: Pixel values as numerics")
+bc1
+
+rm(holdout_range1, train_range1, nbmodel1, pred1)
+rm(pctcorrect_total1, pctcorrect1, ncorrect1, testcols1)
+
+
+##-------------------------------------------------------------------------------------------------
+## ANALYSIS #2 - NAIVE BAYES WITH FACTOR PIXEL VALUES
+##
+## Run an Naive Bayes analysis using factor pixel values.
+
+cat("Analysis #2: Pixel data as factors.\n")
+
+pctcorrect_total2 <- 0
+train2 <- train_fac
+
+for (i in 1:k_folds)
+{
+  # Define the range of indices to be held out for cross-validation
+  holdout_range2 <- c(floor(fold_size * (i - 1) + 1):floor(fold_size * i))
+  train_range2 <- setdiff(1:nrow(train2), holdout_range2)
+  
+  nbmodel2 <- naiveBayes(
+    formula = formula("label ~ ."), 
+    data = train2,
+    laplace = 1, 
+    na.action = na.fail, 
+    subset = train_range2)
+  pred2 <- predict(nbmodel2, newdata = train2[holdout_range2, ], type=c("class"))
+  
+  testcols2 <- train2[holdout_range2, "label"]
+  verify2 <- cbind(label = testcols2, pred = pred2)
+  
+  ncorrect2 <- sum(verify2[, "label"] == verify2[, "pred"])
+  pctcorrect2 <- ncorrect2/nrow(verify2)
+  pctcorrect_total2 <- pctcorrect_total2 + pctcorrect2
+  
+  cat("Test ", i, ": Predicted ", round(pctcorrect2 * 100, digits = 1), "%\n", sep="")
+}
+
+cat("Overall: ", pctcorrect_total2/k_folds, " percent correctly predicted.\n", sep="")
+
+verify2_df <- data.frame(label = factor(verify2[, "label"]-1), pred = factor(verify2[, "pred"]-1))
+bc2 <- barchart_results(as.data.frame(verify2_df), st = "Analysis #2: Pixel values as factors")
+bc2
+
+rm(holdout_range2, train_range2, nbmodel2, pred2)
+rm(pctcorrect_total2, pctcorrect2, ncorrect2, testcols2)
+
+
+##-------------------------------------------------------------------------------------------------
+## ANALYSIS #3 - NAIVE BAYES WITH BINARY NUMERIC PIXEL VALUES
+##
+## Run an Naive Bayes analysis using factor pixel values.
+
+cat("Analysis #3: Pixel data as binary numbers.\n")
+
+pctcorrect_total3 <- 0
+# train3 <- data.frame(label = train1$label, sign(train1[, -1]))
+train3 <- data.frame(label = train1$label, sign(train1[, -1] > 32))
+
+for (i in 1:k_folds)
+{
+  # Define the range of indices to be held out for cross-validation
+  holdout_range3 <- c(floor(fold_size * (i - 1) + 1):floor(fold_size * i))
+  train_range3 <- setdiff(1:nrow(train3), holdout_range3)
+  
+  nbmodel3 <- naiveBayes(
+    formula = formula("label ~ ."), 
+    data = train3,
+    laplace = 1, 
+    na.action = na.fail, 
+    subset = train_range3)
+  pred3 <- predict(nbmodel3, newdata = train3[holdout_range3, ], type=c("class"))
+  
+  testcols3 <- train3[holdout_range3, "label"]
+  verify3 <- cbind(label = testcols3, pred = pred3)
+  
+  ncorrect3 <- sum(verify3[, "label"] == verify3[, "pred"])
+  pctcorrect3 <- ncorrect3/nrow(verify3)
+  pctcorrect_total3 <- pctcorrect_total3 + pctcorrect3
+  
+  cat("Test ", i, ": Predicted ", round(pctcorrect3*100, digits = 1), "%\n", sep="")
+}
+
+cat(
+  "Overall: ", 
+  round((pctcorrect_total3/k_folds) * 100, digits = 1), 
+  " percent correctly predicted.\n", sep="")
+
+verify3_df <- data.frame(label = factor(verify3[, "label"]-1), pred = factor(verify3[, "pred"]-1))
+bc3 <- barchart_results(as.data.frame(verify3_df), st = "Analysis #3: Pixel values as binary numbers")
+bc3
+
+rm(holdout_range3, train_range3, nbmodel3, pred3)
+rm(pctcorrect_total3, pctcorrect3, ncorrect3, testcols3)
+
+
+##-------------------------------------------------------------------------------------------------
+## ANALYSIS #4 - NAIVE BAYES WITH BINARY FACTOR PIXEL VALUES
+##
+## Run an Naive Bayes analysis using binary factor pixel values.
+
+cat("Analysis #4: Pixel data as binary factors\n")
+
+pctcorrect_total4 <- 0
+
+# Create the binary factor data set.
+pixel_bfac <- data.frame(lapply(
+  X = train3[, -1], 
+  FUN = function(x) factor(x = x, levels = c("0", "1"), labels  = c("0", "1"))))
+train4 <- data.frame(label = train3$label, pixel_bfac)
+
+for (i in 1:k_folds)
+{
+  # Define the range of indices to be held out for cross-validation
+  holdout_range4 <- c(floor(fold_size * (i - 1) + 1):floor(fold_size * i))
+  train_range4 <- setdiff(1:nrow(train4), holdout_range4)
+  
+  nbmodel4 <- naiveBayes(
+    formula = formula("label ~ ."), 
+    data = train4,
+    laplace = 1, 
+    na.action = na.fail, 
+    subset = train_range4)
+  pred4 <- predict(nbmodel4, newdata = train4[holdout_range4, ], type=c("class"))
+  
+  testcols4 <- train4[holdout_range4, "label"]
+  verify4 <- cbind(label = testcols4, pred = pred4)
+  
+  ncorrect4 <- sum(verify4[, "label"] == verify4[, "pred"])
+  pctcorrect4 <- ncorrect4/nrow(verify4)
+  pctcorrect_total4 <- pctcorrect_total4 + pctcorrect4
+  
+  cat("Test ", i, ": Predicted ", round(pctcorrect4 * 100, digits = 1), "%\n", sep="")
+}
+
+cat(
+  "Overall: ", 
+  round((pctcorrect_total4/k_folds) * 100, digits = 1), 
+  "% percent correctly predicted.\n", 
+  sep="")
+
+verify4_df <- data.frame(label = factor(verify4[, "label"]-1), pred = factor(verify4[, "pred"]-1))
+bc4 <- barchart_results(as.data.frame(verify4_df), st="Analysis #4: Pixel values as binary factors")
+bc4
+
+rm(holdout_range4, train_range4, nbmodel4, pred4)
+rm(pctcorrect_total4, pctcorrect4, ncorrect4, testcols4)
+
+
+##-------------------------------------------------------------------------------------------------
+## ANALYSIS #5 - NAIVE BAYES WITH BINARY FACTOR PIXEL VALUES
+##
+## Run a decision tree analysis using binary factor pixel values.
+
+cat("Analysis #5: Decision trees using pixel data as binary factors\n")
+
+# Reset the % correct accumulator
+pctcorrect_total5 <- 0
+
+# Initialized the training data set
+train5 <- train4
+
+# Loop across all k-folds...
+for (i in 1:k_folds) {
+  # Define the range of indices to be held out for cross-validation
+  holdout_range5 <- c(floor(fold_size * (i - 1) + 1):floor(fold_size * i))
+  train_range5 <- setdiff(1:nrow(train5), holdout_range5)
+  
+  dttrain5 <- train5[train_range5, ]
+  dttest5 <- train5[holdout_range5, ]
+  
+  dt5 <- rpart(formula = label ~ ., data = dttrain5, method = "class")
+  bplot5 <- fancyRpartPlot(dt5)
+  bplot5
+  
+  pred5 <- predict(dt5, newdata = dttest5, type=c("class"))
+  
+  testcols5 <- dttest5[ , "label"]
+  verify5 <- cbind(label = testcols5, pred = pred5)
+  
+  ncorrect5 <- sum(verify5[, "label"] == verify5[, "pred"])
+  pctcorrect5 <- ncorrect5/nrow(verify5)
+  pctcorrect_total5 <- pctcorrect_total5 + pctcorrect5
+  
+  cat("Test ", i, ": Predicted ", round(pctcorrect5 * 100, digits = 1), "\n", sep="")
+}
+
+cat(
+  "Overall: ", 
+  round((pctcorrect_total5/k_folds) * 100, digits = 1), 
+  " percent correctly predicted.\n", 
+  sep = "")
+
+verify5_df <- data.frame(label = factor(verify5[, "label"]-1), pred = factor(verify5[, "pred"]-1))
+bc5 <- barchart_results(
+  verify5_df,
+  st = "Analysis #5: Decision tree analysis with pixel values as binary factors")
+bc5
+
+rm(holdout_range5, train_range5, pred5)
+rm(pctcorrect_total5, pctcorrect5, ncorrect5, testcols5)
+
+
+##-------------------------------------------------------------------------------------------------
+## FINALE - RUN THE WINNING ALGORITHM ACROSS THE PROVIDED TEST DATA
+##
+## Run an Naive Bayes analysis using binary factor pixel values on the test data.
+
+cat("FINALE: Pixel data as binary factors on supplied test data\n")
+
+# Create the binary factor data set.
+train_final <- train4
+
+nbmodel_finale <- naiveBayes(
+  formula = formula("label ~ ."), data = train_final, laplace = 1, na.action = na.fail)
+pred_finale <- predict(nbmodel_finale, newdata = test_binfac, type=c("class"))
+
+finale_df <- data.frame(digit = as.numeric(pred_finale)-1, stringsAsFactors = FALSE)
+ghisto_finale <- ggplot(data <- finale_df, mapping = aes(x = digit)) +
+  geom_histogram(bins = 10, color="white", fill = "goldenrod") +
+  scale_x_continuous(name = "Digit Predicted", breaks = seq(from = 0, to = 9, by = 1)) +
+  labs(
+    title = "Prediction Volumes for the 1000-element Test Data Set",
+    y = "Prediction Volume")
+ghisto_finale
